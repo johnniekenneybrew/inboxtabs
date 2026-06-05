@@ -10,40 +10,44 @@ const OVERLAY_ID = 'glt-overlay';
 
 let cachedPinned = [];   // [{ id, name }, …]  — kept in sync with storage
 let settingsOpen = false;
+let dragRow = null;      // row currently being dragged in the settings list
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
+// ─── Label discovery (DOM scrape — no API, no OAuth) ───────────────────────────
 
-function getToken() {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({ type: 'GET_TOKEN' }, (resp) => {
-      if (chrome.runtime.lastError) {
-        return reject(new Error(chrome.runtime.lastError.message));
-      }
-      if (resp?.error) return reject(new Error(resp.error));
-      resolve(resp.token);
-    });
+/**
+ * Reads the user's labels straight from Gmail's left sidebar. Every label is
+ * rendered as an <a href="…#label/Name"> element, so we collect those.
+ *
+ * Gmail only puts *visible* labels in the DOM, so this can miss labels that are
+ * collapsed under "More", collapsed nested children, or set to "hide" in the
+ * label list. The settings panel's manual "Add a label" input covers anything
+ * this misses, and a "Retry" affordance covers the case where Gmail simply
+ * hadn't finished rendering yet.
+ *
+ * @returns {{id: string, name: string}[]} deduped, alphabetically sorted.
+ */
+function scrapeLabels() {
+  const out = new Map(); // name → { id, name }   (id === name; we have no API ids)
+  document.querySelectorAll('a[href*="#label/"]').forEach((a) => {
+    const name = labelNameFromHref(a.href);
+    if (name && !out.has(name)) out.set(name, { id: name, name });
   });
+  return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function fetchWithAuth(url) {
-  const token = await getToken();
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (r.status === 401) {
-    // Token may be stale — remove it and let the user retry.
-    chrome.runtime.sendMessage({ type: 'REMOVE_TOKEN', token });
-    throw new Error('Authentication expired. Please click the settings gear to try again.');
+/** Extracts a decoded label name from a Gmail label URL, or null. */
+function labelNameFromHref(href) {
+  const i = href.indexOf('#label/');
+  if (i === -1) return null;
+  let frag = href.slice(i + '#label/'.length);
+  const q = frag.indexOf('?');
+  if (q !== -1) frag = frag.slice(0, q);
+  if (!frag) return null;
+  try {
+    return decodeURIComponent(frag.replace(/\+/g, '%20'));
+  } catch {
+    return frag;
   }
-  if (!r.ok) throw new Error(`Gmail API error ${r.status}`);
-  return r.json();
-}
-
-// ─── Gmail API ────────────────────────────────────────────────────────────────
-
-async function fetchUserLabels() {
-  const data = await fetchWithAuth('https://www.googleapis.com/gmail/v1/users/me/labels');
-  return (data.labels || [])
-    .filter((l) => l.type === 'user')
-    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
@@ -251,7 +255,13 @@ async function openSettings() {
       <h2 class="glt-sp-title" id="glt-panel-title">Label Tabs</h2>
       <button class="glt-sp-x" aria-label="Close settings">&#x2715;</button>
     </div>
-    <p class="glt-sp-hint">Check labels to show as tabs. Drag rows to reorder.</p>
+    <p class="glt-sp-hint">Tick labels to show them as tabs, and drag rows to reorder. Don't see one? Type its name below to add it directly.</p>
+    <div class="glt-sp-add">
+      <input type="text" class="glt-sp-add-input" id="glt-sp-add-input"
+             placeholder="Add a label by name…" aria-label="Add a label by name"
+             autocomplete="off" spellcheck="false">
+      <button class="glt-sp-add-btn" id="glt-sp-add-btn">Add</button>
+    </div>
     <div class="glt-sp-list" id="glt-sp-list">
       <p class="glt-sp-msg">Loading your labels&hellip;</p>
     </div>
@@ -265,100 +275,248 @@ async function openSettings() {
   panel.querySelector('.glt-sp-x').addEventListener('click', closeSettings);
   panel.querySelector('#glt-sp-save').addEventListener('click', handleSave);
 
-  // Trap focus roughly: focus the close button on open
-  panel.querySelector('.glt-sp-x').focus();
+  const listEl  = panel.querySelector('#glt-sp-list');
+  const addInput = panel.querySelector('#glt-sp-add-input');
+  const addBtn   = panel.querySelector('#glt-sp-add-btn');
 
-  const listEl = panel.querySelector('#glt-sp-list');
+  const doAdd = () => {
+    const name = addInput.value.trim();
+    if (!name) return;
+    addManualRow(listEl, name);
+    addInput.value = '';
+    addInput.focus();
+  };
+  addBtn.addEventListener('click', doAdd);
+  addInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doAdd(); }
+  });
 
-  try {
-    const [allLabels, pinned] = await Promise.all([fetchUserLabels(), loadPinned()]);
+  // Focus the add field so the keyboard path is immediate.
+  addInput.focus();
 
-    const pinnedMap = new Map(pinned.map((l) => [l.id, l]));
-
-    // Pinned items first (preserve saved order, but use fresh API name), then unpinned alphabetically
-    const pinnedOrdered = pinned
-      .filter((p) => allLabels.some((l) => l.id === p.id))
-      .map((p) => ({ ...p, name: allLabels.find((l) => l.id === p.id)?.name ?? p.name }));
-    const unpinned = allLabels.filter((l) => !pinnedMap.has(l.id));
-
-    populateList(listEl, [...pinnedOrdered, ...unpinned], pinnedMap);
-  } catch (err) {
-    listEl.innerHTML = `<p class="glt-sp-msg glt-sp-err">${escHtml(err.message)}</p>`;
-  }
+  const pinned = await loadPinned();
+  renderList(listEl, pinned);
 }
 
-function populateList(container, labels, pinnedMap) {
-  container.innerHTML = '';
-  let dragged = null;
+/**
+ * Renders the merged label list into `container`:
+ *   1. Pinned labels first (in saved order), ticked.
+ *   2. Scraped-but-not-yet-pinned labels, alphabetically, unticked.
+ * Pinned labels missing from the current scrape get a soft "unmatched" hint —
+ * they may simply be hidden in the sidebar, or genuinely renamed/deleted.
+ */
+function renderList(container, pinned) {
+  const scraped = scrapeLabels();
+  const scrapedNames = new Set(scraped.map((l) => l.name));
+  const pinnedNames  = new Set(pinned.map((p) => p.name));
 
-  if (labels.length === 0) {
-    container.innerHTML = '<p class="glt-sp-msg">No user-created labels found.</p>';
+  const rows = [
+    ...pinned.map((p) => ({ name: p.name, checked: true, matched: scrapedNames.has(p.name) })),
+    ...scraped
+      .filter((l) => !pinnedNames.has(l.name))
+      .map((l) => ({ name: l.name, checked: false, matched: true })),
+  ];
+
+  container.innerHTML = '';
+
+  // Nothing scraped and nothing pinned → full empty-state with Retry.
+  if (rows.length === 0) {
+    container.appendChild(emptyState(container));
     return;
   }
 
-  labels.forEach((label) => {
-    const row = document.createElement('div');
-    row.className = 'glt-row';
+  // Scrape came back empty but the user has pinned tabs → soft refresh notice.
+  if (scraped.length === 0 && pinned.length > 0) {
+    container.appendChild(retryNotice(container));
+  }
+
+  rows.forEach((r) => container.appendChild(buildRow(container, r)));
+}
+
+function buildRow(container, { name, checked, matched }) {
+  const row = document.createElement('div');
+  row.className = 'glt-row';
+  row.draggable = true;
+  row.dataset.name = name;
+  if (checked) row.classList.add('glt-row--pinned');
+  if (checked && !matched) row.classList.add('glt-row--unmatched');
+
+  row.innerHTML = `
+    <span class="glt-row-handle" aria-hidden="true" title="Drag to reorder">&#x2807;</span>
+    <label class="glt-row-label">
+      <input type="checkbox" class="glt-row-cb"${checked ? ' checked' : ''}>
+      <span class="glt-row-name"></span>
+    </label>
+    <span class="glt-row-warn" tabindex="0" role="img"
+      aria-label="Not visible in your sidebar right now — it may be hidden, renamed, or deleted"
+      title="This label isn't visible in your sidebar right now. It may be tucked under &quot;More&quot;, hidden, renamed, or deleted. Use the pencil to fix the name, or untick to remove.">&#9888;</span>
+    <button class="glt-row-edit" title="Rename this tab" aria-label="Rename this tab">&#9998;</button>
+  `;
+  row.querySelector('.glt-row-name').textContent = name;
+
+  // Keep the pinned visual + edit affordance in sync with the checkbox.
+  const cb = row.querySelector('.glt-row-cb');
+  cb.addEventListener('change', () => {
+    row.classList.toggle('glt-row--pinned', cb.checked);
+    if (!cb.checked) row.classList.remove('glt-row--unmatched');
+  });
+
+  row.querySelector('.glt-row-edit').addEventListener('click', (e) => {
+    e.preventDefault();
+    startEdit(row);
+  });
+
+  attachDragHandlers(container, row);
+  return row;
+}
+
+/** Turns a row's name into an inline text field so a renamed label can be fixed. */
+function startEdit(row) {
+  const nameSpan = row.querySelector('.glt-row-name');
+  if (!nameSpan) return; // already editing
+  const current = row.dataset.name;
+  row.draggable = false;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'glt-row-edit-input';
+  input.value = current;
+  nameSpan.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    const next = (commit ? input.value.trim() : current) || current;
+    const span = document.createElement('span');
+    span.className = 'glt-row-name';
+    span.textContent = next;
+    input.replaceWith(span);
+    row.dataset.name = next;
     row.draggable = true;
-    row.dataset.id = label.id;
-    row.dataset.name = label.name;
+    // The user has asserted this name, so clear any stale "unmatched" hint.
+    if (next !== current) row.classList.remove('glt-row--unmatched');
+  };
 
-    const checked = pinnedMap.has(label.id);
-    row.innerHTML = `
-      <span class="glt-row-handle" aria-hidden="true" title="Drag to reorder">&#x2807;</span>
-      <label class="glt-row-label">
-        <input type="checkbox" class="glt-row-cb"${checked ? ' checked' : ''}>
-        <span class="glt-row-name">${escHtml(label.name)}</span>
-      </label>
-    `;
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')      { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+}
 
-    // ── Drag-and-drop reordering ──
-    row.addEventListener('dragstart', (e) => {
-      dragged = row;
-      e.dataTransfer.effectAllowed = 'move';
-      // Defer class to allow the drag ghost to render first
-      setTimeout(() => row.classList.add('glt-row--dragging'), 0);
-    });
+/** Adds (or re-checks) a label the scrape didn't surface. */
+function addManualRow(container, name) {
+  const existing = [...container.querySelectorAll('.glt-row')]
+    .find((r) => r.dataset.name.toLowerCase() === name.toLowerCase());
 
-    row.addEventListener('dragend', () => {
-      row.classList.remove('glt-row--dragging');
+  if (existing) {
+    const cb = existing.querySelector('.glt-row-cb');
+    cb.checked = true;
+    existing.classList.add('glt-row--pinned');
+    existing.scrollIntoView({ block: 'nearest' });
+    flash(existing);
+    return;
+  }
+
+  // Clear any empty-state / notice placeholder before adding the first real row.
+  container.querySelector('.glt-sp-empty')?.remove();
+
+  // Manually added → treat as matched (user asserted it exists) to avoid a
+  // confusing warning right after they typed it.
+  const row = buildRow(container, { name, checked: true, matched: true });
+  container.prepend(row);
+  flash(row);
+}
+
+function flash(row) {
+  row.classList.add('glt-row--flash');
+  setTimeout(() => row.classList.remove('glt-row--flash'), 700);
+}
+
+/** Full empty state: scrape found nothing and the user has nothing pinned. */
+function emptyState(container) {
+  const wrap = document.createElement('div');
+  wrap.className = 'glt-sp-empty';
+  const msg = document.createElement('p');
+  msg.className = 'glt-sp-msg';
+  msg.textContent =
+    "Couldn't read your labels automatically. Make sure Gmail has finished loading, then click Retry — or just type a label name above to add it directly.";
+  const btn = document.createElement('button');
+  btn.className = 'glt-sp-retry';
+  btn.textContent = 'Retry';
+  btn.addEventListener('click', () => renderList(container, collectChecked(container)));
+  wrap.append(msg, btn);
+  return wrap;
+}
+
+/** Soft notice: scrape failed but the user already has pinned tabs to keep. */
+function retryNotice(container) {
+  const wrap = document.createElement('div');
+  wrap.className = 'glt-sp-notice';
+  const span = document.createElement('span');
+  span.textContent = "Couldn't refresh your label list from Gmail.";
+  const btn = document.createElement('button');
+  btn.className = 'glt-sp-retry glt-sp-retry--inline';
+  btn.textContent = 'Retry';
+  btn.addEventListener('click', () => renderList(container, collectChecked(container)));
+  wrap.append(span, btn);
+  return wrap;
+}
+
+/** Reads the currently-ticked rows, in DOM order, as a pinned-labels array. */
+function collectChecked(container) {
+  const out = [];
+  container.querySelectorAll('.glt-row').forEach((row) => {
+    if (row.querySelector('.glt-row-cb')?.checked) {
+      out.push({ id: row.dataset.name, name: row.dataset.name });
+    }
+  });
+  return out;
+}
+
+// ── Drag-and-drop reordering ──
+function attachDragHandlers(container, row) {
+  row.addEventListener('dragstart', (e) => {
+    dragRow = row;
+    e.dataTransfer.effectAllowed = 'move';
+    // Defer class to allow the drag ghost to render first
+    setTimeout(() => row.classList.add('glt-row--dragging'), 0);
+  });
+
+  row.addEventListener('dragend', () => {
+    row.classList.remove('glt-row--dragging');
+    container.querySelectorAll('.glt-row--over').forEach((r) => r.classList.remove('glt-row--over'));
+    dragRow = null;
+  });
+
+  row.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (row !== dragRow) {
       container.querySelectorAll('.glt-row--over').forEach((r) => r.classList.remove('glt-row--over'));
-      dragged = null;
-    });
+      row.classList.add('glt-row--over');
+    }
+  });
 
-    row.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      if (row !== dragged) {
-        container.querySelectorAll('.glt-row--over').forEach((r) => r.classList.remove('glt-row--over'));
-        row.classList.add('glt-row--over');
-      }
-    });
+  row.addEventListener('dragleave', () => row.classList.remove('glt-row--over'));
 
-    row.addEventListener('dragleave', () => row.classList.remove('glt-row--over'));
-
-    row.addEventListener('drop', (e) => {
-      e.preventDefault();
-      row.classList.remove('glt-row--over');
-      if (!dragged || dragged === row) return;
-      const rows = [...container.querySelectorAll('.glt-row')];
-      const si = rows.indexOf(dragged);
-      const di = rows.indexOf(row);
-      si < di ? row.after(dragged) : row.before(dragged);
-    });
-
-    container.appendChild(row);
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    row.classList.remove('glt-row--over');
+    if (!dragRow || dragRow === row) return;
+    const rows = [...container.querySelectorAll('.glt-row')];
+    const si = rows.indexOf(dragRow);
+    const di = rows.indexOf(row);
+    si < di ? row.after(dragRow) : row.before(dragRow);
   });
 }
 
 async function handleSave() {
-  const rows = document.querySelectorAll('#glt-sp-list .glt-row');
-  const pinned = [];
-  rows.forEach((row) => {
-    if (row.querySelector('.glt-row-cb')?.checked) {
-      pinned.push({ id: row.dataset.id, name: row.dataset.name });
-    }
-  });
+  const listEl = document.getElementById('glt-sp-list');
+  const pinned = collectChecked(listEl);
 
   const saveBtn = document.getElementById('glt-sp-save');
   saveBtn.disabled = true;
@@ -377,14 +535,6 @@ function closeSettings() {
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
-
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 function debounce(fn, ms) {
   let t;
@@ -415,37 +565,10 @@ window.addEventListener('hashchange', () => {
   [200, 500, 1000, 1500].forEach((d) => setTimeout(tryInjectWithRetry, d));
 });
 
-// ─── Label name reconciliation ────────────────────────────────────────────────
-
-/**
- * Silently fetches fresh label names from the API and updates storage if any
- * pinned label was renamed in Gmail. Falls back to cached names on failure.
- */
-async function reconcileLabelNames(pinned) {
-  if (pinned.length === 0) return pinned;
-  try {
-    const allLabels = await fetchUserLabels();
-    const nameById = new Map(allLabels.map((l) => [l.id, l.name]));
-    let changed = false;
-    const updated = pinned.map((p) => {
-      const freshName = nameById.get(p.id);
-      if (freshName && freshName !== p.name) {
-        changed = true;
-        return { ...p, name: freshName };
-      }
-      return p;
-    });
-    if (changed) await savePinned(updated);
-    return updated;
-  } catch {
-    return pinned; // silently use cached names if the API call fails
-  }
-}
-
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 async function init() {
-  cachedPinned = await reconcileLabelNames(await loadPinned());
+  cachedPinned = await loadPinned();
 
   if (injectBar(cachedPinned)) {
     // Gmail was already ready — start observing immediately.

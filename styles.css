@@ -177,11 +177,53 @@
 
 .glt-sp-hint {
   margin: 0;
-  padding: 12px 24px;
+  padding: 12px 24px 8px;
   font-size: 13px;
   color: #5f6368;
   flex-shrink: 0;
 }
+
+/* ── Add-a-label row ─────────────────────────────────────────────────────── */
+
+.glt-sp-add {
+  display: flex;
+  gap: 8px;
+  padding: 4px 24px 12px;
+  flex-shrink: 0;
+}
+
+.glt-sp-add-input {
+  flex: 1;
+  font-family: 'Google Sans', Roboto, Arial, sans-serif;
+  font-size: 14px;
+  color: #202124;
+  padding: 8px 12px;
+  border: 1px solid #dadce0;
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.glt-sp-add-input:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 1px #1a73e8;
+}
+
+.glt-sp-add-btn {
+  all: unset;
+  cursor: pointer;
+  font-family: 'Google Sans', Roboto, Arial, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: #1a73e8;
+  padding: 8px 16px;
+  border: 1px solid #dadce0;
+  border-radius: 6px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.glt-sp-add-btn:hover { background: #f1f3f4; border-color: #d2d5d9; }
+.glt-sp-add-btn:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
 
 /* ── Scrollable label list ───────────────────────────────────────────────── */
 
@@ -266,6 +308,103 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Inline rename field (replaces .glt-row-name while editing) */
+.glt-row-edit-input {
+  flex: 1;
+  min-width: 0;
+  font-family: 'Google Sans', Roboto, Arial, sans-serif;
+  font-size: 14px;
+  color: #202124;
+  padding: 4px 8px;
+  border: 1px solid #1a73e8;
+  border-radius: 4px;
+  outline: none;
+}
+
+/* Soft "this label isn't visible right now" hint — amber, not alarming red */
+.glt-row-warn {
+  display: none;
+  color: #f9ab00;
+  font-size: 15px;
+  line-height: 1;
+  flex-shrink: 0;
+  cursor: help;
+}
+
+.glt-row--unmatched .glt-row-warn {
+  display: inline-block;
+}
+
+/* Rename pencil — only shown on pinned (ticked) rows, on hover/focus */
+.glt-row-edit {
+  all: unset;
+  display: none;
+  cursor: pointer;
+  color: #5f6368;
+  font-size: 14px;
+  width: 26px;
+  height: 26px;
+  line-height: 1;
+  text-align: center;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.glt-row--pinned .glt-row-edit { display: inline-flex; align-items: center; justify-content: center; }
+.glt-row-edit:hover { background: #f1f3f4; color: #1a73e8; }
+.glt-row-edit:focus-visible { outline: 2px solid #1a73e8; }
+
+/* Brief highlight when a row is added/re-checked via manual add */
+.glt-row--flash {
+  animation: glt-flash 700ms ease;
+}
+
+@keyframes glt-flash {
+  from { background: #e8f0fe; }
+  to   { background: transparent; }
+}
+
+/* Empty-state + retry affordances */
+.glt-sp-empty {
+  padding: 8px 12px 16px;
+  text-align: center;
+}
+
+.glt-sp-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 4px 8px;
+  padding: 10px 12px;
+  background: #fef7e0;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #5f6368;
+}
+
+.glt-sp-retry {
+  all: unset;
+  cursor: pointer;
+  font-family: 'Google Sans', Roboto, Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: #1a73e8;
+  padding: 8px 20px;
+  border: 1px solid #dadce0;
+  border-radius: 6px;
+  transition: background 140ms ease;
+}
+
+.glt-sp-retry:hover { background: #f1f3f4; }
+.glt-sp-retry:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
+
+.glt-sp-retry--inline {
+  padding: 6px 14px;
+  flex-shrink: 0;
 }
 
 /* ── Footer ──────────────────────────────────────────────────────────────── */
