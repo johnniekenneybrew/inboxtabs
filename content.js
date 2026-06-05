@@ -12,6 +12,39 @@ let cachedPinned = [];   // [{ id, name }, …]  — kept in sync with storage
 let settingsOpen = false;
 let dragRow = null;      // row currently being dragged in the settings list
 
+// ─── Account identity ─────────────────────────────────────────────────────────
+
+/**
+ * Gmail multi-account URLs are always /mail/u/N/. That index is the stable,
+ * zero-cost account discriminator — no API or DOM scraping needed for the key.
+ */
+function accountIndex() {
+  const m = location.pathname.match(/\/mail\/u\/(\d+)/);
+  return m ? m[1] : '0';
+}
+
+/** Storage key scoped to the active Gmail account. */
+function storageKey() {
+  return `pinnedLabels_u${accountIndex()}`;
+}
+
+/**
+ * Best-effort: reads the active account's email from the Google Account
+ * button's aria-label ("Google Account: Name\n(email@…)").
+ * Returns null if the element isn't in the DOM yet.
+ */
+function accountEmail() {
+  const btn = document.querySelector('[aria-label*="Google Account"]');
+  if (!btn) return null;
+  const m = btn.getAttribute('aria-label').match(/\(([^)]+)\)/);
+  return (m && m[1].includes('@')) ? m[1] : null;
+}
+
+/** Human-readable label for the active account — email if available, else "Account N". */
+function accountLabel() {
+  return accountEmail() ?? `Account ${accountIndex()}`;
+}
+
 // ─── Label discovery (DOM scrape — no API, no OAuth) ───────────────────────────
 
 /**
@@ -53,13 +86,29 @@ function labelNameFromHref(href) {
 // ─── Storage ──────────────────────────────────────────────────────────────────
 
 function loadPinned() {
-  return new Promise((resolve) =>
-    chrome.storage.sync.get('pinnedLabels', (d) => resolve(d.pinnedLabels || []))
-  );
+  const key = storageKey();
+  return new Promise((resolve) => {
+    chrome.storage.sync.get([key, 'pinnedLabels'], (data) => {
+      if (data[key] !== undefined) {
+        // Already on the account-scoped key — normal path.
+        resolve(data[key] || []);
+        return;
+      }
+      // One-time migration: promote the old unscoped key to the account-scoped key.
+      const legacy = data.pinnedLabels || [];
+      if (legacy.length > 0) {
+        chrome.storage.sync.set({ [key]: legacy }, () => resolve(legacy));
+      } else {
+        resolve([]);
+      }
+    });
+  });
 }
 
 function savePinned(labels) {
-  return new Promise((resolve) => chrome.storage.sync.set({ pinnedLabels: labels }, resolve));
+  return new Promise((resolve) =>
+    chrome.storage.sync.set({ [storageKey()]: labels }, resolve)
+  );
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
@@ -252,7 +301,10 @@ async function openSettings() {
 
   panel.innerHTML = `
     <div class="glt-sp-head">
-      <h2 class="glt-sp-title" id="glt-panel-title">Label Tabs</h2>
+      <div class="glt-sp-title-group">
+        <h2 class="glt-sp-title" id="glt-panel-title">Label Tabs</h2>
+        <span class="glt-sp-account" aria-label="Active account"></span>
+      </div>
       <button class="glt-sp-x" aria-label="Close settings">&#x2715;</button>
     </div>
     <p class="glt-sp-hint">Tick labels to show them as tabs, and drag rows to reorder. Don't see one? Type its name below to add it directly.</p>
@@ -274,6 +326,19 @@ async function openSettings() {
 
   panel.querySelector('.glt-sp-x').addEventListener('click', closeSettings);
   panel.querySelector('#glt-sp-save').addEventListener('click', handleSave);
+
+  // Populate the account indicator. accountEmail() may need a moment if Gmail's
+  // account button hasn't rendered yet — retry briefly rather than blocking open.
+  const accountEl = panel.querySelector('.glt-sp-account');
+  const fillAccount = (attempts = 0) => {
+    const label = accountLabel();
+    if (label.includes('@') || attempts >= 10) {
+      accountEl.textContent = label;
+    } else {
+      setTimeout(() => fillAccount(attempts + 1), 150);
+    }
+  };
+  fillAccount();
 
   const listEl  = panel.querySelector('#glt-sp-list');
   const addInput = panel.querySelector('#glt-sp-add-input');
@@ -586,10 +651,11 @@ async function init() {
     waitObs.observe(document.body, { childList: true, subtree: true });
   }
 
-  // Sync tab bar if another tab/window changes the pinned list.
+  // Sync tab bar if another tab/window changes the pinned list for this account.
+  const key = storageKey();
   chrome.storage.onChanged.addListener((changes) => {
-    if (changes.pinnedLabels) {
-      cachedPinned = changes.pinnedLabels.newValue || [];
+    if (changes[key]) {
+      cachedPinned = changes[key].newValue || [];
       injectBar(cachedPinned);
     }
   });

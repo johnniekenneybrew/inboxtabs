@@ -148,12 +148,30 @@
   flex-shrink: 0;
 }
 
+.glt-sp-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
 .glt-sp-title {
   margin: 0;
   font-size: 18px;
   font-weight: 500;
   color: #202124;
   line-height: 1;
+}
+
+/* Active account email / "Account N" shown beneath the panel title */
+.glt-sp-account {
+  font-size: 12px;
+  color: #80868b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  min-height: 16px; /* reserves space while the label is loading */
 }
 
 .glt-sp-x {
